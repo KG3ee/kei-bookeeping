@@ -443,8 +443,24 @@ bot.on('text', async (ctx) => {
       lines.push(`${qty}x ${capitalize(key)} = ${item.price * qty} AED`);
     }
     if (!lines.length) return;
+
+    const explicitPaid = parseNumberOrNull(parsed.paid);
+    let extraMessage = '';
+
+    // If customer paid more than the total, record a credit (shop owes customer)
+    if (explicitPaid !== null && explicitPaid > total) {
+      const credit = Math.round((explicitPaid - total) * 100) / 100;
+      const creditCustomer = saleCustomer || 'Unknown';
+      try {
+        await appendRow(sheets, SHEET_DEBT, [formatDate(now), creditCustomer, 'Overpayment', total, explicitPaid, -credit, 'Credit', '']);
+      } catch (err) {
+        return ctx.reply(`❌ Sheets error while recording overpayment: ${err.message}`);
+      }
+      extraMessage = `\n\n💰 Overpayment of ${credit} AED — shop owes customer ${credit} AED.`;
+    }
+
     await updateSummary(sheets);
-    return ctx.reply(`✅ <b>Sale recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\n<b>Total: ${total} AED</b>`, { parse_mode: 'HTML' });
+    return ctx.reply(`✅ <b>Sale recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\n<b>Total: ${total} AED</b>${extraMessage}`, { parse_mode: 'HTML' });
   }
 
   if (parsed.intent === 'debt') {
@@ -460,7 +476,17 @@ bot.on('text', async (ctx) => {
     }
     if (!validItems.length) return;
     const totalPaid = parseNumberOrNull(parsed.paid) || 0;
-    if (totalPaid > totalItemPrice) return ctx.reply(`⚠️ Paid (${totalPaid}) exceeds total (${totalItemPrice} AED).`);
+    if (totalPaid > totalItemPrice) {
+      // Treat as overpayment: create a credit entry so the shop owes the customer
+      const credit = Math.round((totalPaid - totalItemPrice) * 100) / 100;
+      try {
+        await appendRow(sheets, SHEET_DEBT, [formatDate(now), customer, 'Overpayment', totalItemPrice, totalPaid, -credit, 'Credit', '']);
+      } catch (err) {
+        return ctx.reply(`❌ Sheets error while recording overpayment: ${err.message}`);
+      }
+      await updateSummary(sheets);
+      return ctx.reply(`💸 <b>Overpayment recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\nTotal: ${totalItemPrice} AED\nPaid:  ${totalPaid} AED\n\n✅ ${customer} paid ${totalPaid} AED (overpayment ${credit} AED). Shop owes customer ${credit} AED.`, { parse_mode: 'HTML' });
+    }
     const lines = []; let totalOwed = 0;
     for (const { key, item, qty } of validItems) {
       const itemTotal = item.price * qty;
