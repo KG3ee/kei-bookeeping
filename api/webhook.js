@@ -141,7 +141,14 @@ const parseNumberOrNull = v => {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : null;
 };
+const round2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
 const hasPaidKeyword = text => /\b(?:paid?|pay|pays|payment)\b/i.test(text);
+
+function isCreditRow(row) {
+  const status = (row?.[6] || "").toLowerCase();
+  const stillOwes = parseFloat(row?.[5]) || 0;
+  return status === "credit" || stillOwes < 0;
+}
 
 function extractPaidAmount(text) {
   if (/\b(?:paid?|pay|pays|payment)\s+(?:nothing|none|zero)\b/i.test(text) || /\bno payment\b/i.test(text)) {
@@ -207,6 +214,7 @@ async function updateSummary(sheets) {
   const totalCollected = sales.reduce((s, r) => s + (parseFloat(r[5]) || 0), 0);
   const totalOwed      = debts.filter(r => r[6] === "Pending" ).reduce((s, r) => s + (parseFloat(r[5]) || 0), 0);
   const totalSettled   = debts.filter(r => r[6] === "Settled" ).reduce((s, r) => s + (parseFloat(r[5]) || 0), 0);
+  const totalCredits   = debts.filter(isCreditRow).reduce((s, r) => s + Math.abs(parseFloat(r[5]) || 0), 0);
   const todaySales     = sales.filter(r => r[0] === today);
   const todayRev       = todaySales.reduce((s, r) => s + (parseFloat(r[4]) || 0), 0);
   const todayPaid      = todaySales.reduce((s, r) => s + (parseFloat(r[5]) || 0), 0);
@@ -224,6 +232,7 @@ async function updateSummary(sheets) {
     ["─── DEBTS ───",      ""],
     ["Unsettled Debts",    totalOwed    + " AED"],
     ["Settled Debts",      totalSettled + " AED"],
+    ["Customer Credits",   totalCredits + " AED"],
   ];
 
   await ensureSheet(sheets, SHEET_SUMMARY);
@@ -248,7 +257,8 @@ bot.command(['start', 'help'], async (ctx) => {
     `   "2 matcha lattes and an espresso"\n\n` +
     `💸 <b>Debts:</b>\n` +
     `   "Ahmed got a latte, paid 15"\n` +
-    `   "Sara took a coco matcha, paid nothing"\n\n` +
+    `   "Sara took a coco matcha, paid nothing"\n` +
+    `   "John got a latte, paid 30" (credit)\n\n` +
     `✅ <b>Settle:</b>\n` +
     `   "settle Ahmed"\n\n` +
     `📋 <b>Commands:</b>\n` +
@@ -289,9 +299,11 @@ bot.command('summary', async (ctx) => {
       todayDebt      += parseFloat(r[6]) || 0;
     }
   }
-  let unsettled = 0;
+  let unsettled = 0, credits = 0;
   for (let i = 1; i < debtData.length; i++) {
-    if (debtData[i][6] === "Pending") unsettled += parseFloat(debtData[i][5]) || 0;
+    const row = debtData[i];
+    if (row[6] === "Pending") unsettled += parseFloat(row[5]) || 0;
+    if (isCreditRow(row)) credits += Math.abs(parseFloat(row[5]) || 0);
   }
   await ctx.reply(
     `📊 <b>Sales Summary</b>\n─────────────────────\n` +
@@ -303,7 +315,8 @@ bot.command('summary', async (ctx) => {
     `   Sales:        ${totalSales} AED\n` +
     `   Collected:    ${totalCollected} AED\n` +
     `   Transactions: ${txCount}\n\n` +
-    `⚠️ <b>Unsettled Debts: ${unsettled} AED</b>`,
+    `⚠️ <b>Unsettled Debts: ${round2(unsettled)} AED</b>\n` +
+    `💰 <b>You Owe Customers: ${round2(credits)} AED</b>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -311,23 +324,47 @@ bot.command('summary', async (ctx) => {
 bot.command('debts', async (ctx) => {
   const sheets  = getSheetsClient();
   const data    = await getSheetData(sheets, SHEET_DEBT);
-  const pending = data.slice(1).filter(r => r[6] === "Pending");
-  if (pending.length === 0) return ctx.reply(`🎉 No outstanding debts! All clear.`);
+  const rows    = data.slice(1);
+  const pending = rows.filter(r => r[6] === "Pending");
+  const credits = rows.filter(isCreditRow);
+  if (pending.length === 0 && credits.length === 0) return ctx.reply(`🎉 No outstanding balances! All clear.`);
 
-  const byCustomer = {};
+  const debtByCustomer = {};
   pending.forEach(r => {
     const name = r[1] || "Unknown";
-    if (!byCustomer[name]) byCustomer[name] = { items: [], total: 0 };
-    byCustomer[name].items.push(`${r[2]} (owes ${r[5]} AED)`);
-    byCustomer[name].total += parseFloat(r[5]) || 0;
+    if (!debtByCustomer[name]) debtByCustomer[name] = { items: [], total: 0 };
+    debtByCustomer[name].items.push(`${r[2]} (owes ${r[5]} AED)`);
+    debtByCustomer[name].total += parseFloat(r[5]) || 0;
   });
 
-  let msg = `📋 <b>Outstanding Debts</b>\n─────────────────────\n`;
-  for (const [name, info] of Object.entries(byCustomer)) {
-    msg += `\n👤 <b>${name}</b> — owes <b>${Math.round(info.total * 100) / 100} AED</b>\n`;
-    info.items.forEach(i => msg += `   • ${i}\n`);
-    msg += `   → <code>/settle ${name}</code>\n`;
+  const creditByCustomer = {};
+  credits.forEach(r => {
+    const name = r[1] || "Unknown";
+    const amt = Math.abs(parseFloat(r[5]) || 0);
+    if (!creditByCustomer[name]) creditByCustomer[name] = { items: [], total: 0 };
+    creditByCustomer[name].items.push(`${r[2]} (you owe ${amt} AED)`);
+    creditByCustomer[name].total += amt;
+  });
+
+  let msg = `📋 <b>Balances</b>\n─────────────────────\n`;
+
+  if (Object.keys(debtByCustomer).length) {
+    msg += `\n⚠️ <b>They Owe You</b>\n`;
+    for (const [name, info] of Object.entries(debtByCustomer)) {
+      msg += `\n👤 <b>${name}</b> — owes <b>${round2(info.total)} AED</b>\n`;
+      info.items.forEach(i => msg += `   • ${i}\n`);
+      msg += `   → <code>/settle ${name}</code>\n`;
+    }
   }
+
+  if (Object.keys(creditByCustomer).length) {
+    msg += `\n💰 <b>You Owe Them</b>\n`;
+    for (const [name, info] of Object.entries(creditByCustomer)) {
+      msg += `\n👤 <b>${name}</b> — you owe <b>${round2(info.total)} AED</b>\n`;
+      info.items.forEach(i => msg += `   • ${i}\n`);
+    }
+  }
+
   await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
@@ -476,36 +513,37 @@ bot.on('text', async (ctx) => {
     }
     if (!validItems.length) return;
     const totalPaid = parseNumberOrNull(parsed.paid) || 0;
-    if (totalPaid > totalItemPrice) {
-      // Treat as overpayment: create a credit entry so the shop owes the customer
-      const credit = Math.round((totalPaid - totalItemPrice) * 100) / 100;
-      try {
-        await appendRow(sheets, SHEET_DEBT, [formatDate(now), customer, 'Overpayment', totalItemPrice, totalPaid, -credit, 'Credit', '']);
-      } catch (err) {
-        return ctx.reply(`❌ Sheets error while recording overpayment: ${err.message}`);
-      }
-      await updateSummary(sheets);
-      return ctx.reply(`💸 <b>Overpayment recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\nTotal: ${totalItemPrice} AED\nPaid:  ${totalPaid} AED\n\n✅ ${customer} paid ${totalPaid} AED (overpayment ${credit} AED). Shop owes customer ${credit} AED.`, { parse_mode: 'HTML' });
-    }
+    const overpayment = totalPaid > totalItemPrice ? round2(totalPaid - totalItemPrice) : 0;
+    const appliedPaid = overpayment > 0 ? totalItemPrice : totalPaid;
     const lines = []; let totalOwed = 0;
     for (const { key, item, qty } of validItems) {
       const itemTotal = item.price * qty;
-      const itemPaid  = totalItemPrice > 0 ? Math.round((itemTotal / totalItemPrice) * totalPaid * 100) / 100 : 0;
-      const itemOwed  = Math.round((itemTotal - itemPaid) * 100) / 100;
+      const itemPaid  = totalItemPrice > 0 ? round2((itemTotal / totalItemPrice) * appliedPaid) : 0;
+      const itemOwed  = round2(itemTotal - itemPaid);
       for (let i = 0; i < qty; i++) {
-        const uP = Math.round((itemPaid / qty) * 100) / 100;
-        const uO = Math.round((item.price - uP) * 100) / 100;
+        const uP = round2(itemPaid / qty);
+        const uO = round2(item.price - uP);
         await appendRow(sheets, SHEET_SALES, [formatDate(now), formatTime(now), capitalize(key), item.category, item.price, uP, uO, customer]);
         if (uO > 0) await appendRow(sheets, SHEET_DEBT, [formatDate(now), customer, capitalize(key), item.price, uP, uO, "Pending", ""]);
       }
       totalOwed += itemOwed;
       lines.push(`${qty}x ${capitalize(key)} = ${itemTotal} AED`);
     }
+    if (overpayment > 0) {
+      try {
+        await appendRow(sheets, SHEET_DEBT, [formatDate(now), customer, 'Overpayment', totalItemPrice, totalPaid, -overpayment, 'Credit', '']);
+      } catch (err) {
+        return ctx.reply(`❌ Sheets error while recording overpayment: ${err.message}`);
+      }
+    }
     await updateSummary(sheets);
     const owedText = totalOwed > 0
       ? `⚠️ <b>${customer} owes: ${totalOwed} AED</b>\nTo settle: <code>/settle ${customer}</code>`
       : `✅ Fully paid`;
-    return ctx.reply(`💸 <b>Debt recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\nTotal: ${totalItemPrice} AED\nPaid:  ${totalPaid} AED\n${owedText}`, { parse_mode: 'HTML' });
+    const creditText = overpayment > 0
+      ? `\n💰 <b>You owe ${customer}: ${overpayment} AED</b>`
+      : "";
+    return ctx.reply(`💸 <b>Debt recorded!</b>\n\n${lines.join("\n")}\n─────────────────────\nTotal: ${totalItemPrice} AED\nPaid:  ${totalPaid} AED\n${owedText}${creditText}`, { parse_mode: 'HTML' });
   }
 
   if (parsed.intent === 'settle') {
